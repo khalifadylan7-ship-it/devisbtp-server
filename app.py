@@ -1,23 +1,23 @@
 from flask import Flask, request, jsonify, send_file, make_response
 from flask_cors import CORS
-import io, os, zipfile, datetime, xml.etree.ElementTree as ET, traceback
- 
+import io, os, zipfile, datetime, xml.etree.ElementTree as ET, traceback, base64
+
 app = Flask(__name__)
 CORS(app, origins="*")
- 
+
 @app.after_request
 def cors(r):
     r.headers['Access-Control-Allow-Origin']  = '*'
     r.headers['Access-Control-Allow-Headers'] = 'Content-Type'
     r.headers['Access-Control-Allow-Methods'] = 'GET,POST,OPTIONS'
     return r
- 
+
 def fmt_date(iso):
     try:
         return datetime.datetime.strptime(str(iso)[:10],'%Y-%m-%d').strftime('%d/%m/%Y')
     except:
         return str(iso or '')
- 
+
 def generate_xml(data):
     inv    = data.get('invoice', {})
     seller = data.get('seller', {})
@@ -28,7 +28,7 @@ def generate_xml(data):
     tva_amt  = float(inv.get('tva',0) or 0)
     ttc      = float(inv.get('ttc',0) or 0)
     date_str = str(inv.get('date', datetime.date.today().isoformat()))[:10].replace('-','')
- 
+
     ns = {
         'rsm':'urn:un:unece:uncefact:data:standard:CrossIndustryInvoice:100',
         'ram':'urn:un:unece:uncefact:data:standard:ReusableAggregateBusinessInformationEntity:100',
@@ -36,7 +36,7 @@ def generate_xml(data):
     }
     for p,u in ns.items(): ET.register_namespace(p,u)
     def T(p,n): return f'{{{ns[p]}}}{n}'
- 
+
     root = ET.Element(T('rsm','CrossIndustryInvoice'))
     ctx  = ET.SubElement(root,T('rsm','ExchangedDocumentContext'))
     gp   = ET.SubElement(ctx, T('ram','GuidelineSpecifiedDocumentContextParameter'))
@@ -47,6 +47,7 @@ def generate_xml(data):
     iss  = ET.SubElement(doc,T('ram','IssueDateTime'))
     ET.SubElement(iss,T('udt','DateTimeString'),format='102').text = date_str
     tx   = ET.SubElement(root,T('rsm','SupplyChainTradeTransaction'))
+
     for i,line in enumerate(lines,1):
         li = ET.SubElement(tx,T('ram','IncludedSupplyChainTradeLineItem'))
         ld = ET.SubElement(li,T('ram','AssociatedDocumentLineDocument'))
@@ -65,6 +66,7 @@ def generate_xml(data):
         ET.SubElement(at,T('ram','RateApplicablePercent')).text = str(tva_rate)
         ms = ET.SubElement(st,T('ram','SpecifiedTradeSettlementLineMonetarySummation'))
         ET.SubElement(ms,T('ram','LineTotalAmount')).text = f"{float(line.get('total',0)):.2f}"
+
     ha = ET.SubElement(tx,T('ram','ApplicableHeaderTradeAgreement'))
     sr = ET.SubElement(ha,T('ram','SellerTradeParty'))
     ET.SubElement(sr,T('ram','Name')).text = str(seller.get('company') or seller.get('name',''))
@@ -84,116 +86,188 @@ def generate_xml(data):
     ET.SubElement(tt2,T('ram','RateApplicablePercent')).text= str(tva_rate)
     if tva_rate==0:
         ET.SubElement(tt2,T('ram','ExemptionReason')).text='TVA non applicable art. 293B CGI'
+    # IBAN
+    if seller.get('iban'):
+        pt2 = ET.SubElement(hs,T('ram','SpecifiedTradePaymentTerms'))
+        pai = ET.SubElement(pt2,T('ram','SpecifiedTradeSettlementPaymentMeans'))
+        ET.SubElement(pai,T('ram','TypeCode')).text = '30'
+        acc = ET.SubElement(pai,T('ram','PayeePartyCreditorFinancialAccount'))
+        ET.SubElement(acc,T('ram','IBANID')).text = str(seller['iban']).replace(' ','')
     ms2= ET.SubElement(hs,T('ram','SpecifiedTradeSettlementHeaderMonetarySummation'))
-    ET.SubElement(ms2,T('ram','LineTotalAmount')).text               = f"{ht:.2f}"
-    ET.SubElement(ms2,T('ram','TaxBasisTotalAmount')).text           = f"{ht:.2f}"
-    ET.SubElement(ms2,T('ram','TaxTotalAmount'),currencyID='EUR').text = f"{tva_amt:.2f}"
-    ET.SubElement(ms2,T('ram','GrandTotalAmount')).text              = f"{ttc:.2f}"
-    ET.SubElement(ms2,T('ram','DuePayableAmount')).text              = f"{ttc:.2f}"
+    ET.SubElement(ms2,T('ram','LineTotalAmount')).text                = f"{ht:.2f}"
+    ET.SubElement(ms2,T('ram','TaxBasisTotalAmount')).text            = f"{ht:.2f}"
+    ET.SubElement(ms2,T('ram','TaxTotalAmount'),currencyID='EUR').text= f"{tva_amt:.2f}"
+    ET.SubElement(ms2,T('ram','GrandTotalAmount')).text               = f"{ttc:.2f}"
+    ET.SubElement(ms2,T('ram','DuePayableAmount')).text               = f"{ttc:.2f}"
     return b'<?xml version="1.0" encoding="UTF-8"?>\n'+ET.tostring(root,encoding='unicode').encode('utf-8')
- 
-def generate_html_pdf(data):
-    """Generate HTML invoice that can be printed as PDF"""
-    inv    = data.get('invoice', {})
-    seller = data.get('seller', {})
-    buyer  = data.get('buyer', {})
-    lines  = data.get('lines', [])
+
+def generate_html(data):
+    inv        = data.get('invoice', {})
+    seller     = data.get('seller', {})
+    buyer      = data.get('buyer', {})
+    lines      = data.get('lines', [])
+    payment    = data.get('payment', '')
+    signature  = data.get('signature', None)
+    signer_name= data.get('signerName', '')
+    signer_role= data.get('signerRole', '')
+    signed_at  = data.get('signedAt', '')
+
     ht       = float(inv.get('ht',0) or 0)
     tva_rate = float(inv.get('tvaRate',0) or 0)
     tva_amt  = float(inv.get('tva',0) or 0)
     ttc      = float(inv.get('ttc',0) or 0)
- 
+    today    = datetime.date.today().strftime('%d/%m/%Y')
+
+    seller_name  = str(seller.get('company') or seller.get('name') or '')
+    seller_addr  = str(seller.get('address',''))
+    seller_phone = str(seller.get('phone',''))
+    seller_email = str(seller.get('email',''))
+    seller_siret = str(seller.get('siret',''))
+    seller_iban  = str(seller.get('iban',''))
+    seller_bic   = str(seller.get('bic',''))
+
     rows = ''.join(f"""<tr>
-        <td style="padding:8px;border-bottom:1px solid #eee">{line.get('desc','')}</td>
-        <td style="padding:8px;border-bottom:1px solid #eee;text-align:center">{line.get('qty','')}</td>
-        <td style="padding:8px;border-bottom:1px solid #eee;text-align:right">{float(line.get('pu',0)):.2f} €</td>
-        <td style="padding:8px;border-bottom:1px solid #eee;text-align:right;font-weight:600">{float(line.get('total',0)):.2f} €</td>
+        <td>{line.get('desc','')}</td>
+        <td style="text-align:center">{line.get('qty','')}</td>
+        <td style="text-align:right">{float(line.get('pu',0)):.2f} €</td>
+        <td style="text-align:right;font-weight:700">{float(line.get('total',0)):.2f} €</td>
     </tr>""" for line in lines)
- 
-    tva_mention = 'TVA non applicable – article 293B du CGI' if tva_rate == 0 else ''
-    note = str(inv.get('note',''))
-    today = datetime.date.today().strftime('%d/%m/%Y')
- 
-    seller_name = str(seller.get('company') or seller.get('name') or '')
-    seller_addr = str(seller.get('address',''))
-    seller_phone= str(seller.get('phone',''))
-    seller_email= str(seller.get('email',''))
-    seller_siret= str(seller.get('siret',''))
- 
+
+    tva_mention = '<p style="font-size:11px;color:#888;font-style:italic;margin:8px 0">TVA non applicable – article 293B du CGI</p>' if tva_rate == 0 else ''
+    note_block  = f'<div class="note">{inv.get("note","")}</div>' if inv.get('note') else ''
+
+    # Payment block
+    payment_rows = ''
+    if payment:
+        payment_rows += f'<tr><td class="pk">Mode de règlement</td><td class="pv"><strong>{payment}</strong></td></tr>'
+    if seller_iban:
+        payment_rows += f'<tr><td class="pk">IBAN</td><td class="pv">{seller_iban}</td></tr>'
+    if seller_bic:
+        payment_rows += f'<tr><td class="pk">BIC</td><td class="pv">{seller_bic}</td></tr>'
+    if inv.get('num'):
+        payment_rows += f'<tr><td class="pk">Référence</td><td class="pv">Merci de préciser le N° {inv["num"]} dans votre virement</td></tr>'
+
+    payment_block = f'''<div class="section-title">Informations de paiement</div>
+    <table class="pay-table"><tbody>{payment_rows}</tbody></table>''' if payment_rows else ''
+
+    # Signature block
+    sig_block = ''
+    if signature:
+        sig_block = f'''<div class="section-title" style="margin-top:20px">Signature du client</div>
+        <div style="display:flex;align-items:flex-start;gap:20px;flex-wrap:wrap">
+          <div>
+            <img src="{signature}" style="max-width:220px;max-height:90px;border:1px solid #e5e7eb;border-radius:8px;padding:6px;background:white">
+            <div style="font-size:11px;color:#555;margin-top:6px">
+              <strong>{signer_name}</strong>{' – '+signer_role if signer_role else ''}<br>
+              Signé le {fmt_date(signed_at[:10]) if signed_at else today}
+            </div>
+          </div>
+          <div style="background:#f0fdf4;border:1px solid #bbf7d0;border-radius:8px;padding:10px 14px;font-size:11px;color:#166534">
+            ✅ Signature certifiée<br>électroniquement
+          </div>
+        </div>'''
+
     html = f"""<!DOCTYPE html>
 <html lang="fr"><head><meta charset="UTF-8">
 <title>Facture {inv.get('num','')}</title>
 <style>
-  body{{font-family:Arial,sans-serif;color:#111;margin:0;padding:40px;font-size:13px}}
-  .header{{display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:30px}}
-  .company-name{{font-size:22px;font-weight:bold;color:#f97316}}
-  .invoice-title{{font-size:22px;font-weight:bold;text-align:right}}
-  .invoice-num{{font-size:28px;font-weight:900;color:#f97316;text-align:right}}
-  .info-block{{display:flex;justify-content:space-between;margin-bottom:20px;gap:20px}}
-  .client-box{{background:#f3f4f6;padding:14px;border-radius:8px;flex:1}}
-  .invoice-box{{background:#fff8f1;border:1px solid #fde8d0;padding:14px;border-radius:8px;min-width:200px}}
-  table{{width:100%;border-collapse:collapse;margin:20px 0}}
-  thead th{{background:#111318;color:white;padding:9px 8px;text-align:left;font-size:11px;text-transform:uppercase}}
-  thead th:last-child,thead th:nth-child(3),thead th:nth-child(2){{text-align:right}}
-  thead th:nth-child(2){{text-align:center}}
-  .totals{{display:flex;flex-direction:column;align-items:flex-end;gap:4px;margin-top:10px}}
-  .total-row{{display:flex;justify-content:space-between;min-width:260px;font-size:13px;padding:3px 0;color:#555}}
-  .total-ttc{{font-size:16px;font-weight:900;color:#f97316;border-top:2px solid #f97316;padding-top:8px;margin-top:4px}}
-  .footer{{margin-top:40px;border-top:1px solid #eee;padding-top:12px;font-size:11px;color:#888;text-align:center}}
-  .note{{background:#fff8f1;border-left:3px solid #f97316;padding:10px 14px;margin:16px 0;font-size:12px;color:#666;font-style:italic}}
-  .label{{font-size:10px;font-weight:bold;text-transform:uppercase;color:#888;margin-bottom:4px}}
+  *{{box-sizing:border-box;margin:0;padding:0}}
+  body{{font-family:Arial,sans-serif;color:#111;padding:32px;font-size:13px;line-height:1.4}}
+  .header{{display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:24px;gap:16px}}
+  .co-name{{font-size:20px;font-weight:900;color:#f97316;margin-bottom:6px}}
+  .co-info{{font-size:12px;color:#555;line-height:1.7}}
+  .inv-block{{text-align:right;min-width:180px}}
+  .inv-label{{font-size:10px;font-weight:700;text-transform:uppercase;color:#888;letter-spacing:.06em}}
+  .inv-num{{font-size:20px;font-weight:900;color:#f97316;margin:2px 0}}
+  .inv-meta{{font-size:12px;color:#555;line-height:1.7}}
+  .info-row{{display:flex;gap:16px;margin-bottom:20px}}
+  .client-box{{background:#f3f4f6;padding:12px 16px;border-radius:8px;flex:1}}
+  .fx-box{{background:#fff8f1;border:1px solid #fde8d0;padding:12px 16px;border-radius:8px;font-size:11px;color:#92400e;text-align:center;min-width:130px}}
+  .fx-icon{{font-size:20px;margin-bottom:4px}}
+  .section-title{{font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.07em;color:#888;margin:16px 0 8px}}
+  table.lines{{width:100%;border-collapse:collapse}}
+  table.lines thead th{{background:#111318;color:white;padding:8px 10px;font-size:11px;text-align:left;text-transform:uppercase;letter-spacing:.04em}}
+  table.lines thead th:nth-child(2){{text-align:center}}
+  table.lines thead th:nth-child(3),table.lines thead th:nth-child(4){{text-align:right}}
+  table.lines tbody td{{padding:9px 10px;border-bottom:1px solid #f0f0f0;vertical-align:top}}
+  table.lines tbody td:nth-child(2){{text-align:center}}
+  table.lines tbody td:nth-child(3),table.lines tbody td:nth-child(4){{text-align:right}}
+  table.lines tbody tr:nth-child(even) td{{background:#fafafa}}
+  .totals{{display:flex;flex-direction:column;align-items:flex-end;margin-top:12px;gap:3px}}
+  .tot-row{{display:flex;justify-content:space-between;min-width:240px;font-size:13px;padding:3px 0;color:#555}}
+  .tot-ttc{{font-size:17px;font-weight:900;color:#f97316;border-top:2px solid #f97316;padding-top:8px;margin-top:4px}}
+  .note{{background:#fff8f1;border-left:3px solid #f97316;padding:10px 14px;margin:12px 0;font-size:12px;color:#666;font-style:italic;border-radius:0 6px 6px 0}}
+  table.pay-table{{width:100%;border-collapse:collapse;font-size:12px}}
+  table.pay-table td{{padding:7px 10px;border-bottom:1px solid #f0f0f0}}
+  .pk{{color:#555;width:160px}}
+  .pv{{font-size:12px}}
+  .footer{{margin-top:28px;border-top:1px solid #e5e7eb;padding-top:10px;font-size:10px;color:#aaa;text-align:center;line-height:1.7}}
+  @media print{{body{{padding:20px}}}}
 </style></head><body>
+
 <div class="header">
   <div>
-    <div class="company-name">{seller_name}</div>
-    <div style="color:#666;margin-top:6px;line-height:1.6;font-size:12px">
-      {seller_addr}<br>
+    <div class="co-name">{seller_name}</div>
+    <div class="co-info">
+      {seller_addr+'<br>' if seller_addr else ''}
       {'Tél : '+seller_phone+'<br>' if seller_phone else ''}
       {seller_email+'<br>' if seller_email else ''}
       {'SIRET : '+seller_siret if seller_siret else ''}
     </div>
   </div>
-  <div>
-    <div class="invoice-title">FACTURE</div>
-    <div class="invoice-num">{inv.get('num','')}</div>
-    <div style="color:#888;font-size:12px;text-align:right;margin-top:4px">Date : {fmt_date(inv.get('date',''))}</div>
-    <div style="color:#888;font-size:12px;text-align:right">Échéance : {fmt_date(inv.get('dueDate','')) or '30 jours'}</div>
+  <div class="inv-block">
+    <div class="inv-label">Facture</div>
+    <div class="inv-num">{inv.get('num','')}</div>
+    <div class="inv-meta">
+      Date : {fmt_date(inv.get('date',''))}<br>
+      Échéance : {fmt_date(inv.get('dueDate','')) or '30 jours'}
+    </div>
   </div>
 </div>
-<div class="info-block">
+
+<div class="info-row">
   <div class="client-box">
-    <div class="label">Destinataire</div>
-    <div style="font-weight:bold;font-size:14px">{buyer.get('name','')}</div>
-    <div style="color:#555;margin-top:2px">{buyer.get('address','')}</div>
+    <div style="font-size:10px;font-weight:700;text-transform:uppercase;color:#888;margin-bottom:4px">Destinataire</div>
+    <div style="font-weight:700;font-size:14px">{buyer.get('name','')}</div>
+    {'<div style="color:#555;font-size:12px;margin-top:2px">'+buyer.get('address','')+'</div>' if buyer.get('address') else ''}
   </div>
-  <div class="invoice-box">
-    <div class="label">Factur-X EN16931</div>
-    <div style="font-size:11px;color:#888;margin-top:4px">Facture électronique<br>conforme au standard<br>européen EN16931</div>
+  <div class="fx-box">
+    <div class="fx-icon">🧾</div>
+    <div style="font-weight:700">Factur-X</div>
+    <div style="margin-top:2px">EN16931</div>
   </div>
 </div>
-{f'<div style="margin-bottom:10px"><b>Objet :</b> {inv.get("objet","")}</div>' if inv.get('objet') else ''}
-<table>
-  <thead><tr><th>Description</th><th style="text-align:center">Qté</th><th style="text-align:right">P.U. HT</th><th style="text-align:right">Total HT</th></tr></thead>
+
+{f'<div style="margin-bottom:12px;font-size:13px"><strong>Objet :</strong> {inv.get("objet","")}</div>' if inv.get('objet') else ''}
+
+<div class="section-title">Détail des prestations</div>
+<table class="lines">
+  <thead><tr><th>Description</th><th>Qté</th><th>P.U. HT</th><th>Total HT</th></tr></thead>
   <tbody>{rows}</tbody>
 </table>
+
 <div class="totals">
-  <div class="total-row"><span>Sous-total HT</span><span>{ht:.2f} €</span></div>
-  <div class="total-row"><span>TVA {tva_rate:.0f} %</span><span>{tva_amt:.2f} €</span></div>
-  <div class="total-row total-ttc"><span>TOTAL TTC</span><span>{ttc:.2f} €</span></div>
+  <div class="tot-row"><span>Sous-total HT</span><span>{ht:.2f} €</span></div>
+  <div class="tot-row"><span>TVA {tva_rate:.0f} %</span><span>{tva_amt:.2f} €</span></div>
+  <div class="tot-row tot-ttc"><span>TOTAL TTC</span><span>{ttc:.2f} €</span></div>
 </div>
-{f'<div class="note">{note}</div>' if note else ''}
-{f'<p style="font-size:11px;color:#888;font-style:italic">{tva_mention}</p>' if tva_mention else ''}
+
+{note_block}
+{tva_mention}
+{payment_block}
+{sig_block}
+
 <div class="footer">
   {seller_name}{' • SIRET '+seller_siret if seller_siret else ''}{' • '+seller_addr if seller_addr else ''}<br>
   Facture générée le {today} – Format Factur-X EN16931
 </div>
 </body></html>"""
     return html.encode('utf-8')
- 
+
 @app.route('/', methods=['GET'])
 def health():
     return jsonify({'status':'ok','service':'DevisBTP Factur-X'})
- 
+
 @app.route('/generate', methods=['POST','OPTIONS'])
 def generate():
     if request.method == 'OPTIONS':
@@ -201,16 +275,16 @@ def generate():
     try:
         data      = request.get_json(force=True, silent=True) or {}
         xml_bytes = generate_xml(data)
-        pdf_html  = generate_html_pdf(data)
+        html_bytes= generate_html(data)
         inv_num   = str(data.get('invoice',{}).get('num','facture')).replace('/','_')
         zip_buf   = io.BytesIO()
         with zipfile.ZipFile(zip_buf,'w',zipfile.ZIP_DEFLATED) as zf:
-            zf.writestr(f'{inv_num}_facture.html', pdf_html)
+            zf.writestr(f'{inv_num}_facture.html', html_bytes)
             zf.writestr(f'{inv_num}_facturx.xml',  xml_bytes)
         zip_buf.seek(0)
         return send_file(zip_buf, mimetype='application/zip', as_attachment=True, download_name=f'{inv_num}_facturx.zip')
     except Exception as e:
         return jsonify({'error':str(e),'trace':traceback.format_exc()}), 500
- 
+
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=int(os.environ.get('PORT',5000)))
