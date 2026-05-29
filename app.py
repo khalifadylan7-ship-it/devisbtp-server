@@ -1,18 +1,13 @@
 from flask import Flask, request, jsonify, send_file, make_response
 from flask_cors import CORS
-import io, os, zipfile, datetime, xml.etree.ElementTree as ET, traceback, base64
-import smtplib
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
-from email.mime.base import MIMEBase
-from email import encoders
+import io, os, zipfile, datetime, xml.etree.ElementTree as ET, traceback, base64, requests
 
 app = Flask(__name__)
 CORS(app, origins="*")
 
-FROM_EMAIL = os.environ.get('FROM_EMAIL', '')
-GMAIL_PASS = os.environ.get('GMAIL_PASS', '')
-FROM_NAME  = os.environ.get('FROM_NAME', 'DevisBTP')
+FROM_EMAIL  = os.environ.get('FROM_EMAIL', '')
+FROM_NAME   = os.environ.get('FROM_NAME', 'DevisBTP')
+RESEND_KEY  = os.environ.get('RESEND_API_KEY', '')
 
 def fmt_date(iso):
     try:
@@ -139,31 +134,36 @@ def generate_html(data):
 </body></html>"""
     return html.encode('utf-8')
 
-def send_email_gmail(to_email, to_name, subject, html_body, attachments):
-    if not FROM_EMAIL or not GMAIL_PASS:
-        raise ValueError("Variables d'environnement FROM_EMAIL / GMAIL_PASS non configurées")
-    msg = MIMEMultipart('mixed')
-    msg['From']    = f'{FROM_NAME} <{FROM_EMAIL}>'
-    msg['To']      = f'{to_name} <{to_email}>'
-    msg['Subject'] = subject
-    msg['Reply-To']= FROM_EMAIL
-    msg.attach(MIMEText(html_body, 'html', 'utf-8'))
+def send_email_resend(to_email, to_name, subject, html_body, attachments):
+    if not RESEND_KEY:
+        raise ValueError("Variable d'environnement RESEND_API_KEY non configurée")
+    if not FROM_EMAIL:
+        raise ValueError("Variable d'environnement FROM_EMAIL non configurée")
+    atts = []
     for filename, content in attachments:
-        part = MIMEBase('application', 'octet-stream')
-        part.set_payload(content)
-        encoders.encode_base64(part)
-        part.add_header('Content-Disposition', f'attachment; filename="{filename}"')
-        msg.attach(part)
-    with smtplib.SMTP("smtp.gmail.com", 587, timeout=20) as smtp:
-        smtp.ehlo()
-        smtp.starttls()
-        smtp.ehlo()
-        smtp.login(FROM_EMAIL, GMAIL_PASS)
-        smtp.sendmail(FROM_EMAIL, to_email, msg.as_bytes())
+        atts.append({
+            'filename': filename,
+            'content': base64.b64encode(content).decode('utf-8')
+        })
+    payload = {
+        'from': f'{FROM_NAME} <{FROM_EMAIL}>',
+        'to': [to_email],
+        'subject': subject,
+        'html': html_body,
+        'attachments': atts
+    }
+    resp = requests.post(
+        'https://api.resend.com/emails',
+        headers={'Authorization': f'Bearer {RESEND_KEY}', 'Content-Type': 'application/json'},
+        json=payload,
+        timeout=20
+    )
+    if resp.status_code not in (200, 201):
+        raise ValueError(f"Resend error {resp.status_code}: {resp.text}")
 
 @app.route('/', methods=['GET'])
 def health():
-    return jsonify({'status':'ok','service':'DevisBTP Factur-X PythonAnywhere'})
+    return jsonify({'status':'ok','service':'DevisBTP Factur-X'})
 
 @app.route('/generate', methods=['POST','OPTIONS'])
 def generate():
@@ -212,7 +212,7 @@ def send_email():
             subject   = f"Votre facture {inv_num} – {seller_name}"
             html_body = f'<div style="font-family:Arial;max-width:600px;padding:20px"><h2 style="color:#f97316">{seller_name}</h2><p>Bonjour {to_name},</p><p>Veuillez trouver en pièce jointe votre facture <strong>{inv_num}</strong> d\'un montant de <strong>{ttc:.2f} €</strong> TTC.</p><br><p>Cordialement,<br><strong>{seller_name}</strong></p></div>'
             attachments = [(f'{inv_num}_facture.html', html_bytes), (f'{inv_num}_facturx.xml', xml_bytes)]
-        send_email_gmail(to_email, to_name, subject, html_body, attachments)
+        send_email_resend(to_email, to_name, subject, html_body, attachments)
         return jsonify({'success': True, 'message': f'Email envoyé à {to_email}'})
     except Exception as e:
         return jsonify({'error': str(e), 'trace': traceback.format_exc()}), 500
