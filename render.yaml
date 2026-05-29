@@ -1,14 +1,1 @@
-services:
-  - type: web
-    name: devisbtp-facturx
-    env: python
-    buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --workers 2
-    plan: free
-    envVars:
-      - key: PYTHON_VERSION
-        value: 3.11.0
-      - key: FROM_EMAIL
-        value: splendore835@gmail.com
-      - key: GMAIL_PASS
-        value: cbilootypjjdsovet
+
