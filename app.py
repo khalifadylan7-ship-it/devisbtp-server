@@ -1,14 +1,18 @@
 from flask import Flask, request, jsonify, send_file, make_response
 from flask_cors import CORS
 import io, os, zipfile, datetime, xml.etree.ElementTree as ET, traceback, base64, json
-import urllib.request, urllib.error
+import smtplib
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from email.mime.base import MIMEBase
+from email import encoders
 
 app = Flask(__name__)
 CORS(app, origins="*")
 
-BREVO_KEY  = os.environ.get('BREVO_KEY', '')
-FROM_EMAIL = os.environ.get('FROM_EMAIL', 'noreply@devisbtp.fr')
-FROM_NAME  = os.environ.get('FROM_NAME', 'DevisBTP')
+FROM_EMAIL     = os.environ.get('FROM_EMAIL', '')
+GMAIL_PASS     = os.environ.get('GMAIL_PASS', '')
+FROM_NAME      = os.environ.get('FROM_NAME', 'Splendore')
 
 @app.after_request
 def cors(r):
@@ -237,48 +241,32 @@ def generate_html(data):
 </body></html>"""
     return html.encode('utf-8')
 
-def send_email_brevo(to_email, to_name, subject, html_body, attachments):
-    """Send email via Brevo API with attachments"""
-    if not BREVO_KEY:
-        raise Exception("Clé Brevo non configurée")
+def send_email_gmail(to_email, to_name, subject, html_body, attachments):
+    if not FROM_EMAIL or not GMAIL_PASS:
+        raise Exception("Gmail non configuré")
 
-    att_list = []
-    for name, content in attachments:
-        att_list.append({
-            "name": name,
-            "content": base64.b64encode(content).decode('utf-8')
-        })
+    msg = MIMEMultipart('mixed')
+    msg['From']    = f'{FROM_NAME} <{FROM_EMAIL}>'
+    msg['To']      = f'{to_name} <{to_email}>'
+    msg['Subject'] = subject
+    msg['Reply-To']= FROM_EMAIL
 
-    payload = {
-        "sender":  {"name": FROM_NAME, "email": FROM_EMAIL},
-        "to":      [{"email": to_email, "name": to_name}],
-        "replyTo": {"email": FROM_EMAIL},
-        "subject": subject,
-        "htmlContent": html_body,
-        "attachment": att_list
-    }
+    msg.attach(MIMEText(html_body, 'html', 'utf-8'))
 
-    data = json.dumps(payload).encode('utf-8')
-    req  = urllib.request.Request(
-        'https://api.brevo.com/v3/smtp/email',
-        data=data,
-        headers={
-            'api-key': BREVO_KEY,
-            'Content-Type': 'application/json',
-            'Accept': 'application/json'
-        },
-        method='POST'
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            return True, resp.read().decode()
-    except urllib.error.HTTPError as e:
-        err = e.read().decode()
-        raise Exception(f"Brevo error {e.code}: {err}")
+    for filename, content in attachments:
+        part = MIMEBase('application', 'octet-stream')
+        part.set_payload(content)
+        encoders.encode_base64(part)
+        part.add_header('Content-Disposition', f'attachment; filename="{filename}"')
+        msg.attach(part)
+
+    with smtplib.SMTP_SSL('smtp.gmail.com', 465, timeout=20) as smtp:
+        smtp.login(FROM_EMAIL, GMAIL_PASS)
+        smtp.sendmail(FROM_EMAIL, to_email, msg.as_bytes())
 
 @app.route('/', methods=['GET'])
 def health():
-    return jsonify({'status':'ok','service':'DevisBTP Factur-X','brevo': bool(BREVO_KEY)})
+    return jsonify({'status':'ok','service':'DevisBTP Factur-X','gmail': bool(FROM_EMAIL and GMAIL_PASS)})
 
 @app.route('/generate', methods=['POST','OPTIONS'])
 def generate():
@@ -306,51 +294,47 @@ def send_email():
         data       = request.get_json(force=True, silent=True) or {}
         to_email   = data.get('to_email','')
         to_name    = data.get('to_name','')
-        subject    = data.get('subject','Votre facture')
-        msg_type   = data.get('type','client')  # 'client' or 'accountant'
+        msg_type   = data.get('type','client')
+        inv_data   = data.get('invoice_data', {})
 
         if not to_email:
             return jsonify({'error':'Email destinataire manquant'}), 400
 
-        inv_data   = data.get('invoice_data', {})
         xml_bytes  = generate_xml(inv_data)
         html_bytes = generate_html(inv_data)
         inv_num    = str(inv_data.get('invoice',{}).get('num','facture')).replace('/','_')
         seller_name= str(inv_data.get('seller',{}).get('company') or inv_data.get('seller',{}).get('name',''))
+        ttc        = float(inv_data.get('invoice',{}).get('ttc',0))
 
         if msg_type == 'accountant':
-            subject  = subject or f"Facture Factur-X {inv_num} – {seller_name}"
-            html_body= f"""<div style="font-family:Arial,sans-serif;max-width:600px">
-                <h2 style="color:#f97316">Facture électronique Factur-X</h2>
+            subject   = f"Facture Factur-X {inv_num} – {seller_name}"
+            html_body = f"""<div style="font-family:Arial,sans-serif;max-width:600px;padding:20px">
+                <h2 style="color:#f97316">{seller_name}</h2>
                 <p>Bonjour,</p>
                 <p>Veuillez trouver en pièce jointe la facture électronique <strong>{inv_num}</strong> au format Factur-X EN16931.</p>
                 <p>Cette facture est conforme au standard européen de facturation électronique.</p>
                 <br><p>Cordialement,<br><strong>{seller_name}</strong></p>
             </div>"""
-            attachments = [
-                (f'{inv_num}_facturx.xml', xml_bytes),
-                (f'{inv_num}_facture.html', html_bytes)
-            ]
+            attachments = [(f'{inv_num}_facturx.xml', xml_bytes), (f'{inv_num}_facture.html', html_bytes)]
         else:
-            subject  = subject or f"Votre facture {inv_num} – {seller_name}"
-            ttc      = float(inv_data.get('invoice',{}).get('ttc',0))
-            html_body= f"""<div style="font-family:Arial,sans-serif;max-width:600px">
+            subject   = f"Votre facture {inv_num} – {seller_name}"
+            html_body = f"""<div style="font-family:Arial,sans-serif;max-width:600px;padding:20px">
                 <h2 style="color:#f97316">{seller_name}</h2>
                 <p>Bonjour {to_name},</p>
                 <p>Veuillez trouver en pièce jointe votre facture <strong>{inv_num}</strong> d'un montant de <strong>{ttc:.2f} €</strong> TTC.</p>
                 <p>N'hésitez pas à nous contacter pour toute question.</p>
                 <br><p>Cordialement,<br><strong>{seller_name}</strong></p>
             </div>"""
-            attachments = [
-                (f'{inv_num}_facture.html', html_bytes),
-                (f'{inv_num}_facturx.xml', xml_bytes)
-            ]
+            attachments = [(f'{inv_num}_facture.html', html_bytes), (f'{inv_num}_facturx.xml', xml_bytes)]
 
-        send_email_brevo(to_email, to_name, subject, html_body, attachments)
+        send_email_gmail(to_email, to_name, subject, html_body, attachments)
         return jsonify({'success': True, 'message': f'Email envoyé à {to_email}'})
 
     except Exception as e:
         return jsonify({'error': str(e), 'trace': traceback.format_exc()}), 500
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=int(os.environ.get('PORT',5000)))
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=int(os.environ.get('PORT',5000)))
