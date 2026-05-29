@@ -8,3 +8,7 @@ services:
     envVars:
       - key: PYTHON_VERSION
         value: 3.11.0
+      - key: FROM_EMAIL
+        value: splendore835@gmail.com
+      - key: GMAIL_PASS
+        value: cbilootypjjdsovet
